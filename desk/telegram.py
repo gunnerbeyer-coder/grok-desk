@@ -42,7 +42,7 @@ async def _call(ctx, method: str, body: dict) -> dict | None:
     if not token:
         return None
     try:
-        resp = await ctx.http.post(f"{API}/bot{token}/{method}", json=body, timeout=35)
+        resp = await ctx.vendors.http.post(f"{API}/bot{token}/{method}", json=body, timeout=35)
         data = resp.json()
         if not isinstance(data, dict) or not data.get("ok"):
             log.warning("telegram %s not ok", method)
