@@ -312,51 +312,170 @@ async def _evaluate_body(ctx, mint: str, pool_type: str, waited_s: float) -> Non
         ctx.db.activity("kill", f"{symbol or mint[:4]} {decision}", mint, {"reason": decision})
 
 
-async def run(ctx, stop: asyncio.Event) -> None:
-    queue: asyncio.Queue = asyncio.Queue()
-    last_price: dict[str, float] = {}
-    await asyncio.gather(
-        _socket_loop(ctx, queue, stop),
-        _batch_loop(ctx, queue, stop),
-        _waiting_loop(ctx, last_price, stop),
+# Reconnect bounds. A dead TCP session can sit in retransmit for many minutes;
+# these caps are what keep that off the rest of the desk.
+OPEN_TIMEOUT = 10
+RECV_TIMEOUT = 20
+CLOSE_TIMEOUT = 2
+WATCHDOG_AFTER = 45
+EVAL_TIMEOUT = 20
+
+
+class LiveSocket:
+    """The socket the watchdog is allowed to abort from another task."""
+
+    def __init__(self) -> None:
+        self.ws = None
+        self.force = asyncio.Event()
+        self.touched = time.monotonic()
+
+    def touch(self) -> None:
+        self.touched = time.monotonic()
+
+    def abort(self) -> None:
+        self.force.set()
+        ws = self.ws
+        transport = getattr(ws, "transport", None) if ws is not None else None
+        if transport is not None:
+            try:
+                transport.abort()
+            except Exception:
+                pass
+
+
+async def close_socket(ws, timeout: float = CLOSE_TIMEOUT) -> None:
+    """End a socket without waiting out a dead peer.
+
+    `async with websockets.connect()` calls close(), which shields the
+    "connection lost" wait. On ConnectionClosedError that wait is the dead
+    TCP session. Abort the transport if the handshake does not finish.
+    """
+    if ws is None:
+        return
+    transport = getattr(ws, "transport", None)
+    try:
+        await asyncio.wait_for(ws.close(), timeout=timeout)
+    except Exception:
+        pass
+    if transport is not None:
+        try:
+            transport.abort()
+        except Exception:
+            pass
+
+
+async def interruptible_sleep(seconds: float, stop: asyncio.Event, live: LiveSocket) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if stop.is_set() or live.force.is_set():
+            return
+        await asyncio.sleep(min(1.0, deadline - time.monotonic()))
+
+
+async def open_pumpportal():
+    # proxy=None skips urllib.getproxies(), which is a blocking DNS lookup
+    # inside the async connect path and ignores open_timeout.
+    return await websockets.connect(
+        PUMPPORTAL_WS,
+        proxy=None,
+        open_timeout=OPEN_TIMEOUT,
+        close_timeout=CLOSE_TIMEOUT,
+        ping_interval=20,
+        ping_timeout=10,
+        max_size=1_000_000,
     )
 
 
-async def _socket_loop(ctx, queue: asyncio.Queue, stop: asyncio.Event) -> None:
-    backoff = 2
+def scanner_is_stale(live: LiveSocket, now: float | None = None, after: float = WATCHDOG_AFTER) -> bool:
+    clock = time.monotonic() if now is None else now
+    return clock - live.touched > after
+
+
+async def watchdog_step(ctx, live: LiveSocket, after: float = WATCHDOG_AFTER) -> bool:
+    """Force a reconnect when the socket itself has gone quiet."""
+    if not scanner_is_stale(live, after=after):
+        return False
+    log.warning("scanner watchdog reconnect")
+    ctx.db.heartbeat("scanner", "error", "watchdog")
+    live.abort()
+    return True
+
+
+async def run(ctx, stop: asyncio.Event) -> None:
+    queue: asyncio.Queue = asyncio.Queue()
+    last_price: dict[str, float] = {}
+    live = LiveSocket()
+    await asyncio.gather(
+        _socket_loop(ctx, queue, stop, live),
+        _batch_loop(ctx, queue, stop),
+        _waiting_loop(ctx, last_price, stop),
+        _watchdog(ctx, live, stop),
+    )
+
+
+async def _watchdog(ctx, live: LiveSocket, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
-            async with websockets.connect(
-                PUMPPORTAL_WS,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=1_000_000,
-            ) as ws:
-                await ws.send(json.dumps({"method": "subscribeMigration"}))
-                ctx.db.heartbeat("scanner", "ok", "subscribed migrations")
-                backoff = 2
-                while not stop.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
-                    except asyncio.TimeoutError:
-                        ctx.db.heartbeat("scanner", "ok", "listening")
-                        continue
-                    try:
-                        payload = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    messages = payload if isinstance(payload, list) else [payload]
-                    for msg in messages:
-                        parsed = parse_migration(msg)
-                        if parsed:
-                            await queue.put(parsed)
+            await asyncio.wait_for(stop.wait(), timeout=10)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await watchdog_step(ctx, live)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            log.warning("scanner watchdog: %s", type(exc).__name__)
+
+
+async def _socket_loop(ctx, queue: asyncio.Queue, stop: asyncio.Event, live: LiveSocket, connect=open_pumpportal) -> None:
+    backoff = 2.0
+    while not stop.is_set():
+        if live.force.is_set():
+            live.force.clear()
+        ws = None
+        failed = False
+        try:
+            live.touch()
+            ctx.db.heartbeat("scanner", "ok", "connecting")
+            ws = await asyncio.wait_for(connect(), timeout=OPEN_TIMEOUT + 2)
+            live.ws = ws
+            await asyncio.wait_for(ws.send(json.dumps({"method": "subscribeMigration"})), timeout=10)
+            live.touch()
+            ctx.db.heartbeat("scanner", "ok", "subscribed migrations")
+            backoff = 2.0
+            while not stop.is_set() and not live.force.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
+                except asyncio.TimeoutError:
+                    live.touch()
+                    ctx.db.heartbeat("scanner", "ok", "listening")
+                    continue
+                live.touch()
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                messages = payload if isinstance(payload, list) else [payload]
+                for msg in messages:
+                    parsed = parse_migration(msg)
+                    if parsed:
+                        await queue.put(parsed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failed = True
             log.warning("pumpportal reconnect: %s", type(exc).__name__)
             ctx.db.heartbeat("scanner", "error", type(exc).__name__)
-            await asyncio.sleep(backoff)
-            backoff = min(30, backoff * 2)
+            live.touch()
+        finally:
+            live.ws = None
+            await close_socket(ws)
+        if stop.is_set():
+            return
+        if failed or live.force.is_set():
+            await interruptible_sleep(backoff, stop, live)
+            backoff = min(30.0, backoff * 2)
 
 
 async def _batch_loop(ctx, queue: asyncio.Queue, stop: asyncio.Event) -> None:
@@ -382,7 +501,14 @@ async def _batch_loop(ctx, queue: asyncio.Queue, stop: asyncio.Event) -> None:
                 first_seen=int(time.time()),
             )
             try:
-                await _evaluate(ctx, mint, parsed.get("pool_type") or "", 0)
+                await asyncio.wait_for(
+                    _evaluate(ctx, mint, parsed.get("pool_type") or "", 0),
+                    timeout=EVAL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _inflight.discard(mint)
+                log.warning("scan evaluate timed out")
+                ctx.db.heartbeat("scanner", "error", "evaluate timeout")
             except Exception as exc:
                 log.warning("scan evaluate failed: %s", type(exc).__name__)
                 ctx.db.heartbeat("scanner", "error", type(exc).__name__)
@@ -392,16 +518,22 @@ async def _waiting_loop(ctx, last_price: dict, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             waiting = ctx.db.coins_by_status(("waiting",))
-            mints = [c["mint"] for c in waiting]
-            await _price_waiting(ctx, mints, last_price)
+            ctx.db.heartbeat("scanner", "ok", f"waiting {len(waiting)}")
+            mints = [c["mint"] for c in waiting[:8]]
+            await asyncio.wait_for(_price_waiting(ctx, mints, last_price), timeout=EVAL_TIMEOUT)
             now = time.time()
-            for coin in waiting:
+            for coin in waiting[:8]:
                 waited = now - float(coin.get("first_seen") or now)
                 try:
-                    await _evaluate(ctx, coin["mint"], coin.get("pool_type") or "", waited)
+                    await asyncio.wait_for(
+                        _evaluate(ctx, coin["mint"], coin.get("pool_type") or "", waited),
+                        timeout=EVAL_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    _inflight.discard(coin["mint"])
+                    log.warning("waiting recheck timed out")
                 except Exception as exc:
                     log.warning("waiting recheck failed: %s", type(exc).__name__)
-            ctx.db.heartbeat("scanner", "ok", f"waiting {len(waiting)}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

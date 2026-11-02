@@ -311,7 +311,9 @@ def maybe_push(cfg, rel: str, runner=None) -> bool:
     run = runner or subprocess.run
 
     def call(args):
-        return run(args, cwd=str(root), capture_output=True)
+        # timeout kills a stalled git process. The writer also runs this off
+        # the event loop so the kill wait cannot freeze the other agents.
+        return run(args, cwd=str(root), capture_output=True, timeout=20)
 
     added = call(["git", "add", "-f", "--", rel])
     if getattr(added, "returncode", 1) != 0:
@@ -379,8 +381,15 @@ async def run(ctx, stop: asyncio.Event) -> None:
                 interval = max(15, int(ctx.cfg.pages_push_sec or 60))
                 if ctx.cfg.pages_push and now - last_push >= interval:
                     rel = str(Path(ctx.cfg.pages_dir) / "d" / ctx.cfg.data_path)
-                    maybe_push(ctx.cfg, rel)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(maybe_push, ctx.cfg, rel),
+                            timeout=25,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("pages push timed out")
                     last_push = now
+                    ctx.db.heartbeat("writer", "ok", "snapshot")
             else:
                 ctx.db.heartbeat("writer", "disabled", "DATA_PATH unset")
         except SnapshotRefused:
