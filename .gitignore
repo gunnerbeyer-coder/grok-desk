@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+logs/
+data/*.sqlite
+data/*.sqlite-*
+data/*.db
+docs/d/*
+!docs/d/.gitkeep
+*.tmp
+.DS_Store
