@@ -18,6 +18,11 @@ def _files():
             continue
         if any(part in {".git", "__pycache__", ".venv", "venv", "logs", ".pytest_cache"} for part in path.parts):
             continue
+        # Published Plan B snapshots are generated output. They carry the
+        # signup link the writer already built. Source files still cannot.
+        parts = path.parts
+        if "docs" in parts and "d" in parts:
+            continue
         if path.suffix in {".png", ".sqlite"}:
             continue
         yield path
