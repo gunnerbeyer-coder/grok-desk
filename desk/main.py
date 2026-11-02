@@ -75,7 +75,11 @@ async def amain() -> None:
         "on" if cfg.pages_push else "off",
     )
     stop = asyncio.Event()
-    async with httpx.AsyncClient(headers={"user-agent": "grok-desk"}) as http:
+    # A missing per-call timeout must not park a connection until the kernel gives up.
+    async with httpx.AsyncClient(
+        headers={"user-agent": "grok-desk"},
+        timeout=httpx.Timeout(20.0, pool=5.0),
+    ) as http:
         ctx = Desk(cfg, db, Bus(), Vendors(http, cfg.rpc_url))
         tasks = [
             asyncio.create_task(scanner.run(ctx, stop), name="scanner"),

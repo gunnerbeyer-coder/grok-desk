@@ -263,6 +263,16 @@ async def on_callback(ctx, callback: dict) -> None:
     await _reply(ctx, chat_id, text)
 
 
+async def _stop_task(task: asyncio.Task) -> None:
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=1)
+    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+        pass
+
+
 async def run(ctx, stop: asyncio.Event) -> None:
     if not ctx.cfg.tg_token:
         ctx.db.heartbeat("telegram", "disabled", "TG_TOKEN unset")
@@ -287,8 +297,8 @@ async def run(ctx, stop: asyncio.Event) -> None:
             return_when=asyncio.FIRST_COMPLETED,
         )
         if stop.is_set():
-            push_task.cancel()
-            poll_task.cancel()
+            await _stop_task(push_task)
+            await _stop_task(poll_task)
             break
         if push_task in done:
             try:
@@ -300,10 +310,10 @@ async def run(ctx, stop: asyncio.Event) -> None:
                 if owner:
                     await send(ctx, owner, item.get("text") or "", item.get("buttons") or None)
             if poll_task not in done:
-                poll_task.cancel()
+                await _stop_task(poll_task)
         if poll_task in done:
             if push_task not in done:
-                push_task.cancel()
+                await _stop_task(push_task)
             try:
                 data = poll_task.result()
             except Exception as exc:
@@ -332,7 +342,7 @@ async def run(ctx, stop: asyncio.Event) -> None:
                     log.warning("telegram update: %s", type(exc).__name__)
         else:
             if push_task not in done:
-                push_task.cancel()
+                await _stop_task(push_task)
             if poll_task not in done:
-                poll_task.cancel()
+                await _stop_task(poll_task)
         ctx.db.heartbeat("telegram", "ok", "polling")
