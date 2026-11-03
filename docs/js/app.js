@@ -2,7 +2,10 @@
    FOMO links are taken from that JSON. This file does not build them. */
 (function () {
   var PATH_RE = /^[A-Za-z0-9_-]{32,128}$/;
-  var ROSTER = ["scanner", "auditor", "analyst", "executor", "risk"];
+  var ROSTER = ["scanner", "auditor", "analyst", "executor", "risk", "copier"];
+  var statsScope = "today";
+  var SOURCE_LABEL = {migration: "Migration", trending: "Trending", copy: "Copy", gt_new: "New pools",
+    gt_trending: "Gecko hot", dex_new: "Takeovers", pump_movers: "Pump movers"};
   var SETTING_ROWS = [
     ["mode", "Mode"],
     ["paused", "Paused"],
@@ -244,6 +247,30 @@
       "</div>";
   }
 
+  function perfHtml() {
+    var all = state && state.stats;
+    if (!all) return "";
+    var s = all[statsScope] || {total: {}, by_source: {}};
+    var t = s.total || {};
+    function wr(x) { return x == null ? "—" : Math.round(x) + "%"; }
+    function sg(x) { return x == null ? "—" : signed(x); }
+    var tabs = ["today", "all"].map(function (k) {
+      return '<button type="button" class="pill' + (statsScope === k ? " on" : "") + '" data-scope="' + k + '">' +
+        (k === "today" ? "Today" : "All time") + "</button>";
+    }).join("");
+    var rows = Object.keys(s.by_source || {}).map(function (k) {
+      var r = s.by_source[k];
+      return '<div class="srcrow"><span>' + esc(SOURCE_LABEL[k] || k) + '</span><span class="num">' + r.trades +
+        '</span><span class="num">' + wr(r.win_rate) + '</span><span class="num ' + cls(r.pnl) + '">' + esc(sg(r.pnl)) +
+        '</span><span class="num ' + cls(r.avg) + '">' + esc(sg(r.avg)) + "</span></div>";
+    }).join("");
+    return '<div class="section"><h2>Performance</h2><span class="scopes">' + tabs + "</span></div>" +
+      '<div class="stats">' + stat(wr(t.win_rate), "Win rate") + stat(sg(t.pnl), "Total PnL") +
+      stat(sg(t.avg), "Avg trade") + stat(String(t.trades || 0), "Trades") + "</div>" +
+      '<div class="card srctable"><div class="srcrow head"><span>Source</span><span>Trades</span><span>Win</span><span>PnL</span><span>Avg</span></div>' +
+      (rows || '<p class="empty">No closed trades</p>') + "</div>";
+  }
+
   function stat(value, label) {
     return "<div><b class=\"num\">" + esc(value) + "</b><span>" + esc(label) + "</span></div>";
   }
@@ -358,7 +385,7 @@
       : '<p class="empty">No open positions</p>';
     var feed = items().slice().reverse().slice(0, 4);
     var feedHtml = feed.length ? feed.map(feedRow).join("") : '<p class="empty">No activity yet</p>';
-    return equityHtml(m) + statsHtml(m) +
+    return equityHtml(m) + statsHtml(m) + perfHtml() +
       '<div class="section"><h2>Relay</h2><span>' + m.online + " agents · " + m.inflight + " in flight</span></div>" +
       stages(m) + alertHtml(m) +
       '<div class="section"><h2>Open positions</h2><span>' + m.positions.length + " open · " +
@@ -550,6 +577,12 @@
   }
 
   function bind() {
+    document.querySelectorAll("[data-scope]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        statsScope = button.getAttribute("data-scope");
+        paint();
+      });
+    });
     document.querySelectorAll("[data-tab]").forEach(function (button) {
       button.addEventListener("click", function () {
         if (mode !== "ready") return;
